@@ -2,7 +2,7 @@
 -- Module      : System.ZMQ3
 -- Copyright   : (c) 2010-2012 Toralf Wittner
 -- License     : MIT
--- Maintainer  : toralf.wittner@gmail.com
+-- Maintainer  : Toralf Wittner <tw@dtex.org>
 -- Stability   : experimental
 -- Portability : non-portable
 --
@@ -75,8 +75,11 @@ module System.ZMQ3 (
   , Context
   , Socket
   , Flag (SendMore)
+  , Switch (..)
   , Timeout
   , Event (..)
+  , EventType (..)
+  , EventMsg (..)
 
     -- ** Type Classes
   , SocketType
@@ -103,6 +106,7 @@ module System.ZMQ3 (
   , withContext
   , withSocket
   , bind
+  , unbind
   , connect
   , send
   , send'
@@ -110,17 +114,28 @@ module System.ZMQ3 (
   , receive
   , receiveMulti
   , version
+  , monitor
 
   , System.ZMQ3.subscribe
   , System.ZMQ3.unsubscribe
 
+    -- * Context Options (Read)
+  , ioThreads
+  , maxSockets
+
+    -- * Context Options (Write)
+  , setIoThreads
+  , setMaxSockets
+
     -- * Socket Options (Read)
   , System.ZMQ3.affinity
   , System.ZMQ3.backlog
+  , System.ZMQ3.delayAttachOnConnect
   , System.ZMQ3.events
   , System.ZMQ3.fileDescriptor
   , System.ZMQ3.identity
   , System.ZMQ3.ipv4Only
+  , System.ZMQ3.lastEndpoint
   , System.ZMQ3.linger
   , System.ZMQ3.maxMessageSize
   , System.ZMQ3.mcastHops
@@ -135,25 +150,37 @@ module System.ZMQ3 (
   , System.ZMQ3.sendBuffer
   , System.ZMQ3.sendHighWM
   , System.ZMQ3.sendTimeout
+  , System.ZMQ3.tcpKeepAlive
+  , System.ZMQ3.tcpKeepAliveCount
+  , System.ZMQ3.tcpKeepAliveIdle
+  , System.ZMQ3.tcpKeepAliveInterval
 
     -- * Socket Options (Write)
   , setAffinity
   , setBacklog
+  , setDelayAttachOnConnect
   , setIdentity
+  , setIpv4Only
   , setLinger
+  , setMaxMessageSize
+  , setMcastHops
   , setRate
   , setReceiveBuffer
+  , setReceiveHighWM
+  , setReceiveTimeout
   , setReconnectInterval
   , setReconnectIntervalMax
   , setRecoveryInterval
+  , setRouterMandatory
   , setSendBuffer
-  , setIpv4Only
-  , setMcastHops
-  , setReceiveHighWM
-  , setReceiveTimeout
   , setSendHighWM
   , setSendTimeout
-  , setMaxMessageSize
+  , setTcpAcceptFilter
+  , setTcpKeepAlive
+  , setTcpKeepAliveCount
+  , setTcpKeepAliveIdle
+  , setTcpKeepAliveInterval
+  , setXPubVerbose
 
     -- * Restrictions
   , Data.Restricted.restrict
@@ -168,6 +195,8 @@ module System.ZMQ3 (
     -- * Low-level Functions
   , init
   , term
+  , context
+  , destroy
   , socket
   , close
   , waitRead
@@ -355,25 +384,34 @@ version =
   where
     tupleUp a b c = (fromIntegral a, fromIntegral b, fromIntegral c)
 
--- | Initialize a 0MQ context (cf. zmq_init for details).  You should
--- normally prefer to use 'withContext' instead.
 init :: Size -> IO Context
-init ioThreads = do
-    c <- throwIfNull "init" $ c_zmq_init (fromIntegral ioThreads)
-    return (Context c)
+init n = do
+    c <- context
+    setIoThreads n c
+    return c
+{-# DEPRECATED init "Use context" #-}
 
--- | Terminate a 0MQ context (cf. zmq_term).  You should normally
--- prefer to use 'withContext' instead.
+-- | Initialize a 0MQ context (cf. zmq_ctx_new for details).  You should
+-- normally prefer to use 'withContext' instead.
+context :: IO Context
+context = Context <$> throwIfNull "init" c_zmq_ctx_new
+
 term :: Context -> IO ()
-term = throwIfMinus1Retry_ "term" . c_zmq_term . ctx
+term = destroy
+{-# DEPRECATED term "Use destroy" #-}
+
+-- | Terminate a 0MQ context (cf. zmq_ctx_destroy).  You should normally
+-- prefer to use 'withContext' instead.
+destroy :: Context -> IO ()
+destroy = throwIfMinus1Retry_ "term" . c_zmq_ctx_destroy . _ctx
 
 -- | Run an action with a 0MQ context.  The 'Context' supplied to your
 -- action will /not/ be valid after the action either returns or
 -- throws an exception.
-withContext :: Size -> (Context -> IO a) -> IO a
-withContext ioThreads act =
-  bracket (throwIfNull "withContext (init)" $ c_zmq_init (fromIntegral ioThreads))
-          (throwIfMinus1Retry_ "withContext (term)" . c_zmq_term)
+withContext :: (Context -> IO a) -> IO a
+withContext act =
+  bracket (throwIfNull "withContext (new)" $ c_zmq_ctx_new)
+          (throwIfMinus1Retry_ "withContext (destroy)" . c_zmq_ctx_destroy)
           (act . Context)
 
 -- | Run an action with a 0MQ socket. The socket will be closed after running
@@ -420,6 +458,14 @@ moreToReceive s = (== 1) <$> getInt32Option B.receiveMore s
 
 -- Read
 
+-- | Cf. @zmq_ctx_get ZMQ_IO_THREADS@
+ioThreads :: Context -> IO Word
+ioThreads = ctxIntOption "ioThreads" _ioThreads
+
+-- | Cf. @zmq_ctx_get ZMQ_MAX_SOCKETS@
+maxSockets :: Context -> IO Word
+maxSockets = ctxIntOption "maxSockets" _maxSockets
+
 -- | Cf. @zmq_getsockopt ZMQ_IDENTITY@
 identity :: Socket a -> IO String
 identity s = getStrOpt s B.identity
@@ -440,9 +486,17 @@ ipv4Only s = (== 1) <$> getInt32Option B.ipv4Only s
 backlog :: Socket a -> IO Int
 backlog = getInt32Option B.backlog
 
+-- | Cf. @zmq_getsockopt ZMQ_DELAY_ATTACH_ON_CONNECT@
+delayAttachOnConnect :: Socket a -> IO Bool
+delayAttachOnConnect s = (== 1) <$> getInt32Option B.delayAttachOnConnect s
+
 -- | Cf. @zmq_getsockopt ZMQ_LINGER@
 linger :: Socket a -> IO Int
 linger = getInt32Option B.linger
+
+-- | Cf. @zmq_getsockopt ZMQ_LAST_ENDPOINT@
+lastEndpoint :: Socket a -> IO String
+lastEndpoint s = getStrOpt s B.lastEndpoint
 
 -- | Cf. @zmq_getsockopt ZMQ_RATE@
 rate :: Socket a -> IO Int
@@ -488,7 +542,34 @@ sendTimeout = getInt32Option B.sendTimeout
 sendHighWM :: Socket a -> IO Int
 sendHighWM = getInt32Option B.sendHighWM
 
+-- | Cf. @zmq_getsockopt ZMQ_TCP_KEEPALIVE@
+tcpKeepAlive :: Socket a -> IO Switch
+tcpKeepAlive s = getInt32Option B.tcpKeepAlive s >>= convert . toSwitch
+  where
+    convert Nothing  = throwError "Invalid value for ZMQ_TCP_KEEPALIVE"
+    convert (Just i) = return i
+
+-- | Cf. @zmq_getsockopt ZMQ_TCP_KEEPALIVE_CNT@
+tcpKeepAliveCount :: Socket a -> IO Int
+tcpKeepAliveCount = getInt32Option B.tcpKeepAliveCount
+
+-- | Cf. @zmq_getsockopt ZMQ_TCP_KEEPALIVE_IDLE@
+tcpKeepAliveIdle :: Socket a -> IO Int
+tcpKeepAliveIdle = getInt32Option B.tcpKeepAliveIdle
+
+-- | Cf. @zmq_getsockopt ZMQ_TCP_KEEPALIVE_INTVL@
+tcpKeepAliveInterval :: Socket a -> IO Int
+tcpKeepAliveInterval = getInt32Option B.tcpKeepAliveInterval
+
 -- Write
+
+-- | Cf. @zmq_ctx_set ZMQ_IO_THREADS@
+setIoThreads :: Word -> Context -> IO ()
+setIoThreads n = setCtxIntOption "ioThreads" _ioThreads n
+
+-- | Cf. @zmq_ctx_set ZMQ_MAX_SOCKETS@
+setMaxSockets :: Word -> Context -> IO ()
+setMaxSockets n = setCtxIntOption "maxSockets" _maxSockets n
 
 -- | Cf. @zmq_setsockopt ZMQ_IDENTITY@
 setIdentity :: Restricted N1 N254 String -> Socket a -> IO ()
@@ -498,14 +579,17 @@ setIdentity x s = setStrOpt s B.identity (rvalue x)
 setAffinity :: Word64 -> Socket a -> IO ()
 setAffinity x s = setIntOpt s B.affinity x
 
+-- | Cf. @zmq_setsockopt ZMQ_DELAY_ATTACH_ON_CONNECT@
+setDelayAttachOnConnect :: Bool -> Socket a -> IO ()
+setDelayAttachOnConnect x s = setIntOpt s B.delayAttachOnConnect (bool2cint x)
+
 -- | Cf. @zmq_setsockopt ZMQ_MAXMSGSIZE@
 setMaxMessageSize :: Integral i => Restricted Nneg1 Int64 i -> Socket a -> IO ()
 setMaxMessageSize x s = setIntOpt s B.maxMessageSize ((fromIntegral . rvalue $ x) :: Int64)
 
 -- | Cf. @zmq_setsockopt ZMQ_IPV4ONLY@
 setIpv4Only :: Bool -> Socket a -> IO ()
-setIpv4Only True s  = setIntOpt s B.ipv4Only (1 :: CInt)
-setIpv4Only False s = setIntOpt s B.ipv4Only (0 :: CInt)
+setIpv4Only x s  = setIntOpt s B.ipv4Only (bool2cint x)
 
 -- | Cf. @zmq_setsockopt ZMQ_LINGER@
 setLinger :: Integral i => Restricted Nneg1 Int32 i -> Socket a -> IO ()
@@ -514,6 +598,10 @@ setLinger = setInt32OptFromRestricted B.linger
 -- | Cf. @zmq_setsockopt ZMQ_RCVTIMEO@
 setReceiveTimeout :: Integral i => Restricted Nneg1 Int32 i -> Socket a -> IO ()
 setReceiveTimeout = setInt32OptFromRestricted B.receiveTimeout
+
+-- | Cf. @zmq_setsockopt ZMQ_ROUTER_MANDATORY@
+setRouterMandatory :: Bool -> Socket Router -> IO ()
+setRouterMandatory x s = setIntOpt s B.routerMandatory (bool2cint x)
 
 -- | Cf. @zmq_setsockopt ZMQ_SNDTIMEO@
 setSendTimeout :: Integral i => Restricted Nneg1 Int32 i -> Socket a -> IO ()
@@ -559,10 +647,47 @@ setReceiveHighWM = setInt32OptFromRestricted B.receiveHighWM
 setSendHighWM :: Integral i => Restricted N0 Int32 i -> Socket a -> IO ()
 setSendHighWM = setInt32OptFromRestricted B.sendHighWM
 
+-- | Cf. @zmq_setsockopt ZMQ_TCP_ACCEPT_FILTER@
+setTcpAcceptFilter :: Maybe String -> Socket a -> IO ()
+setTcpAcceptFilter Nothing sock = onSocket "setTcpAcceptFilter" sock $ \s ->
+    throwIfMinus1Retry_ "setStrOpt" $
+        c_zmq_setsockopt s (optVal tcpAcceptFilter) nullPtr 0
+setTcpAcceptFilter (Just dat) sock = onSocket "setTcpAcceptFilter" sock $ \s ->
+    throwIfMinus1Retry_ "setStrOpt" $
+        withCStringLen dat $ \(ptr, len) ->
+            c_zmq_setsockopt s (optVal tcpAcceptFilter)
+                               (castPtr ptr)
+                               (fromIntegral len)
+
+-- | Cf. @zmq_setsockopt ZMQ_TCP_KEEPALIVE@
+setTcpKeepAlive :: Switch -> Socket a -> IO ()
+setTcpKeepAlive x s = setIntOpt s B.tcpKeepAlive (fromSwitch x :: CInt)
+
+-- | Cf. @zmq_setsockopt ZMQ_TCP_KEEPALIVE_CNT@
+setTcpKeepAliveCount :: Integral i => Restricted Nneg1 Int32 i -> Socket a -> IO ()
+setTcpKeepAliveCount = setInt32OptFromRestricted B.tcpKeepAliveCount
+
+-- | Cf. @zmq_setsockopt ZMQ_TCP_KEEPALIVE_IDLE@
+setTcpKeepAliveIdle :: Integral i => Restricted Nneg1 Int32 i -> Socket a -> IO ()
+setTcpKeepAliveIdle = setInt32OptFromRestricted B.tcpKeepAliveIdle
+
+-- | Cf. @zmq_setsockopt ZMQ_TCP_KEEPALIVE_INTVL@
+setTcpKeepAliveInterval :: Integral i => Restricted Nneg1 Int32 i -> Socket a -> IO ()
+setTcpKeepAliveInterval = setInt32OptFromRestricted B.tcpKeepAliveInterval
+
+-- | Cf. @zmq_setsockopt ZMQ_XPUB_VERBOSE@
+setXPubVerbose :: Bool -> Socket XPub -> IO ()
+setXPubVerbose x s = setIntOpt s B.xpubVerbose (bool2cint x)
+
 -- | Bind the socket to the given address (cf. zmq_bind)
 bind :: Socket a -> String -> IO ()
 bind sock str = onSocket "bind" sock $
     throwIfMinus1_ "bind" . withCString str . c_zmq_bind
+
+-- | Unbind the socket from the given address (cf. zmq_unbind)
+unbind :: Socket a -> String -> IO ()
+unbind sock str = onSocket "unbind" sock $
+    throwIfMinus1_ "unbind" . withCString str . c_zmq_unbind
 
 -- | Connect the socket to the given address (cf. zmq_connect).
 connect :: Socket a -> String -> IO ()
@@ -630,6 +755,39 @@ receiveMulti sock = recvall []
 
     next acc True  = recvall acc
     next acc False = return (reverse acc)
+
+-- | Setup socket monitoring, i.e. a 'Pair' socket which
+-- sends monitoring events about the given 'Socket' to the
+-- given address.
+socketMonitor :: [EventType] -> String -> Socket a -> IO ()
+socketMonitor es addr soc = onSocket "socketMonitor" soc $ \s ->
+    withCString addr $ \a ->
+        throwIfMinus1_ "zmq_socket_monitor" $
+            c_zmq_socket_monitor s a (events2cint es)
+
+-- | Monitor socket events.
+-- This function returns a function which can be invoked to retrieve
+-- the next socket event, potentially blocking until the next one becomes
+-- available. When applied to 'False', monitoring will terminate, i.e.
+-- internal monitoring resources will be disposed. Consequently after
+-- 'monitor' has been invoked, the returned function must be applied
+-- /once/ to 'False'.
+monitor :: [EventType] -> Context -> Socket a -> IO (Bool -> IO (Maybe EventMsg))
+monitor es ctx sock = do
+    let addr = "inproc://" ++ show (_socket sock)
+    s <- socket ctx Pair
+    socketMonitor es addr sock
+    connect s addr
+    next s <$> messageInit
+  where
+    next soc m False = messageClose m `finally` close soc >> return Nothing
+    next soc m True  = onSocket "recv" soc $ \s -> do
+        retry "recv" (waitRead soc) $ c_zmq_recvmsg s (msgPtr m) (flagVal dontWait)
+        ptr <- c_zmq_msg_data (msgPtr m)
+        str <- peekByteOff ptr zmqEventAddrOffset >>= SB.packCString
+        dat <- peekByteOff ptr zmqEventDataOffset :: IO CInt
+        tag <- peek ptr :: IO CInt
+        return . Just $ eventMessage str dat (ZMQEventType tag)
 
 -- Convert bit-masked word into Event.
 toEvent :: Word32 -> Event

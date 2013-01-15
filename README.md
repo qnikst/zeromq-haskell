@@ -5,6 +5,11 @@ Current status
 
 This software currently has *beta* status, i.e. it had seen limited testing.
 
+Version 0.2   - Add additional functionality from 3.2 stable release, e.g.
+                zmq_proxy support, new socket options, socket monitoring etc.
+                *API Change*: withContext no longer accepts the number of
+                I/O threads as first argument.
+
 Version 0.1.4 - Expose 'waitRead' and 'waitWrite'.
 
 Version 0.1.3 - Deprecated 'Xreq', 'XRep' in favour of 'Dealer' and 'Router'
@@ -62,5 +67,5 @@ Bugs
 
 If you find any bugs or other shortcomings I would greatly appreciate a bug
 report, preferably via http://github.com/twittner/zeromq-haskell/issues or
-e-mail to toralf.wittner@gmail.com
+e-mail to tw@dtex.org
 
