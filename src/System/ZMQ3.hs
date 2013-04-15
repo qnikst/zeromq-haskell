@@ -1,3 +1,4 @@
+{-# LANGUAGE GADTs #-}
 -- |
 -- Module      : System.ZMQ3
 -- Copyright   : (c) 2010-2012 Toralf Wittner
@@ -53,14 +54,6 @@
 -- Devices are no longer present in 0MQ 3.x and consequently have been
 -- removed form this binding as well.
 --
--- /Poll/
---
--- Removed support for polling. This should not be necessary as 'send' and
--- 'receive' are internally non-blocking and use GHC's I/O manager to block
--- calling threads when send or receive would yield EAGAIN. This combined with
--- GHC's scalable threading model should relieve client code from the burden
--- to do it's own polling.
---
 -- /Error Handling/
 --
 -- The type 'ZMQError' is introduced, together with inspection functions 'errno',
@@ -80,6 +73,7 @@ module System.ZMQ3 (
   , Event (..)
   , EventType (..)
   , EventMsg (..)
+  , Poll (..)
 
     -- ** Type Classes
   , SocketType
@@ -115,6 +109,7 @@ module System.ZMQ3 (
   , receiveMulti
   , version
   , monitor
+  , poll
 
   , System.ZMQ3.subscribe
   , System.ZMQ3.unsubscribe
@@ -210,12 +205,13 @@ import Prelude hiding (init)
 import qualified Prelude as P
 import Control.Applicative
 import Control.Exception
-import Control.Monad (unless, when, void)
+import Control.Monad (unless, void)
+import Control.Monad.IO.Class
+import Data.List (intersect, foldl')
 import Data.Restricted
-import Data.IORef (atomicModifyIORef)
 import Foreign hiding (throwIf, throwIf_, throwIfNull, void)
 import Foreign.C.String
-import Foreign.C.Types (CInt)
+import Foreign.C.Types (CInt, CShort)
 import qualified Data.ByteString as SB
 import qualified Data.ByteString.Lazy as LB
 import System.Posix.Types (Fd(..))
@@ -309,10 +305,6 @@ data Pull = Pull
 -- node becomes available for sending; messages are not discarded.
 data Push = Push
 
--- | Socket types.
-class SocketType a where
-    zmqSocketType :: a -> ZMQSocketType
-
 -- | Sockets which can 'subscribe'.
 class Subscriber a
 
@@ -367,10 +359,15 @@ instance Sender     Push
 data Event =
     In     -- ^ ZMQ_POLLIN (incoming messages)
   | Out    -- ^ ZMQ_POLLOUT (outgoing messages, i.e. at least 1 byte can be written)
-  | InOut  -- ^ ZMQ_POLLIN | ZMQ_POLLOUT
-  | Native -- ^ ZMQ_POLLERR
-  | None
-  deriving (Eq, Ord, Show)
+  | Err    -- ^ ZMQ_POLLERR
+  deriving (Eq, Ord, Read, Show)
+
+-- | Type representing a descriptor, poll is waiting for
+-- (either a 0MQ socket or a file descriptor) plus the type
+-- of event to wait for.
+data Poll m where
+    Sock :: Socket s -> [Event] -> Maybe ([Event] -> m ()) -> Poll m
+    File :: Fd -> [Event] -> Maybe ([Event] -> m ()) -> Poll m
 
 -- | Return the runtime version of the underlying 0MQ library as a
 -- (major, minor, patch) triple.
@@ -403,7 +400,7 @@ term = destroy
 -- | Terminate a 0MQ context (cf. zmq_ctx_destroy).  You should normally
 -- prefer to use 'withContext' instead.
 destroy :: Context -> IO ()
-destroy = throwIfMinus1Retry_ "term" . c_zmq_ctx_destroy . _ctx
+destroy c = throwIfMinus1Retry_ "term" . c_zmq_ctx_destroy . _ctx $ c
 
 -- | Run an action with a 0MQ context.  The 'Context' supplied to your
 -- action will /not/ be valid after the action either returns or
@@ -423,30 +420,26 @@ withSocket c t = bracket (socket c t) close
 -- | Create a new 0MQ socket within the given context. 'withSocket' provides
 -- automatic socket closing and may be safer to use.
 socket :: SocketType a => Context -> a -> IO (Socket a)
-socket (Context c) t = do
-  let zt = typeVal . zmqSocketType $ t
-  throwIfNull "socket" (c_zmq_socket c zt) >>= mkSocket
+socket c t = Socket <$> mkSocketRepr t c
 
 -- | Close a 0MQ socket. 'withSocket' provides automatic socket closing and may
 -- be safer to use.
 close :: Socket a -> IO ()
-close sock@(Socket _ status) = onSocket "close" sock $ \s -> do
-  alive <- atomicModifyIORef status (\b -> (False, b))
-  when alive $ throwIfMinus1_ "close" . c_zmq_close $ s
+close = closeSock . _socketRepr
 
 -- | Subscribe Socket to given subscription.
-subscribe :: Subscriber a => Socket a -> String -> IO ()
-subscribe s = setStrOpt s B.subscribe
+subscribe :: Subscriber a => Socket a -> SB.ByteString -> IO ()
+subscribe s = setByteStringOpt s B.subscribe
 
 -- | Unsubscribe Socket from given subscription.
-unsubscribe :: Subscriber a => Socket a -> String -> IO ()
-unsubscribe s = setStrOpt s B.unsubscribe
+unsubscribe :: Subscriber a => Socket a -> SB.ByteString -> IO ()
+unsubscribe s = setByteStringOpt s B.unsubscribe
 
 -- Read Only
 
 -- | Cf. @zmq_getsockopt ZMQ_EVENTS@
-events :: Socket a -> IO Event
-events s = toEvent <$> getIntOpt s B.events 0
+events :: Socket a -> IO [Event]
+events s = toEvents <$> getIntOpt s B.events 0
 
 -- | Cf. @zmq_getsockopt ZMQ_FD@
 fileDescriptor :: Socket a -> IO Fd
@@ -467,8 +460,8 @@ maxSockets :: Context -> IO Word
 maxSockets = ctxIntOption "maxSockets" _maxSockets
 
 -- | Cf. @zmq_getsockopt ZMQ_IDENTITY@
-identity :: Socket a -> IO String
-identity s = getStrOpt s B.identity
+identity :: Socket a -> IO SB.ByteString
+identity s = getByteStringOpt s B.identity
 
 -- | Cf. @zmq_getsockopt ZMQ_AFFINITY@
 affinity :: Socket a -> IO Word64
@@ -572,8 +565,8 @@ setMaxSockets :: Word -> Context -> IO ()
 setMaxSockets n = setCtxIntOption "maxSockets" _maxSockets n
 
 -- | Cf. @zmq_setsockopt ZMQ_IDENTITY@
-setIdentity :: Restricted N1 N254 String -> Socket a -> IO ()
-setIdentity x s = setStrOpt s B.identity (rvalue x)
+setIdentity :: Restricted N1 N254 SB.ByteString -> Socket a -> IO ()
+setIdentity x s = setByteStringOpt s B.identity (rvalue x)
 
 -- | Cf. @zmq_setsockopt ZMQ_AFFINITY@
 setAffinity :: Word64 -> Socket a -> IO ()
@@ -648,16 +641,11 @@ setSendHighWM :: Integral i => Restricted N0 Int32 i -> Socket a -> IO ()
 setSendHighWM = setInt32OptFromRestricted B.sendHighWM
 
 -- | Cf. @zmq_setsockopt ZMQ_TCP_ACCEPT_FILTER@
-setTcpAcceptFilter :: Maybe String -> Socket a -> IO ()
+setTcpAcceptFilter :: Maybe SB.ByteString -> Socket a -> IO ()
 setTcpAcceptFilter Nothing sock = onSocket "setTcpAcceptFilter" sock $ \s ->
     throwIfMinus1Retry_ "setStrOpt" $
         c_zmq_setsockopt s (optVal tcpAcceptFilter) nullPtr 0
-setTcpAcceptFilter (Just dat) sock = onSocket "setTcpAcceptFilter" sock $ \s ->
-    throwIfMinus1Retry_ "setStrOpt" $
-        withCStringLen dat $ \(ptr, len) ->
-            c_zmq_setsockopt s (optVal tcpAcceptFilter)
-                               (castPtr ptr)
-                               (fromIntegral len)
+setTcpAcceptFilter (Just dat) sock = setByteStringOpt sock tcpAcceptFilter dat
 
 -- | Cf. @zmq_setsockopt ZMQ_TCP_KEEPALIVE@
 setTcpKeepAlive :: Switch -> Socket a -> IO ()
@@ -704,7 +692,7 @@ send :: Sender a => Socket a -> [Flag] -> SB.ByteString -> IO ()
 send sock fls val = bracket (messageOf val) messageClose $ \m ->
   onSocket "send" sock $ \s ->
     retry "send" (waitWrite sock) $
-          c_zmq_sendmsg s (msgPtr m) (combine (DontWait : fls))
+          c_zmq_sendmsg s (msgPtr m) (combineFlags (DontWait : fls))
 
 -- | Send the given 'LB.ByteString' over the socket (cf. zmq_sendmsg).
 -- This is operationally identical to @send socket (Strict.concat
@@ -718,7 +706,7 @@ send' :: Sender a => Socket a -> [Flag] -> LB.ByteString -> IO ()
 send' sock fls val = bracket (messageOfLazy val) messageClose $ \m ->
   onSocket "send'" sock $ \s ->
     retry "send'" (waitWrite sock) $
-          c_zmq_sendmsg s (msgPtr m) (combine (DontWait : fls))
+          c_zmq_sendmsg s (msgPtr m) (combineFlags (DontWait : fls))
 
 -- | Send a multi-part message.
 -- This function applies the 'SendMore' 'Flag' between all message parts.
@@ -774,7 +762,7 @@ socketMonitor es addr soc = onSocket "socketMonitor" soc $ \s ->
 -- /once/ to 'False'.
 monitor :: [EventType] -> Context -> Socket a -> IO (Bool -> IO (Maybe EventMsg))
 monitor es ctx sock = do
-    let addr = "inproc://" ++ show (_socket sock)
+    let addr = "inproc://" ++ show (_socket . _socketRepr $ sock)
     s <- socket ctx Pair
     socketMonitor es addr sock
     connect s addr
@@ -789,13 +777,51 @@ monitor es ctx sock = do
         tag <- peek ptr :: IO CInt
         return . Just $ eventMessage str dat (ZMQEventType tag)
 
--- Convert bit-masked word into Event.
-toEvent :: Word32 -> Event
-toEvent e | e == (fromIntegral . pollVal $ pollIn)    = In
-          | e == (fromIntegral . pollVal $ pollOut)   = Out
-          | e == (fromIntegral . pollVal $ pollInOut) = InOut
-          | e == (fromIntegral . pollVal $ pollerr)   = Native
-          | otherwise                                 = None
+-- | Polls for events on the given 'Poll' descriptors. Returns the
+-- same list of 'Poll' descriptors with an "updated" 'PollEvent' field
+-- (cf. zmq_poll). Sockets which have seen no activity have 'None' in
+-- their 'PollEvent' field.
+poll :: MonadIO m => Timeout -> [Poll m] -> m [[Event]]
+poll to desc = do
+    let len = length desc
+    let ps  = map toZMQPoll desc
+    ps' <- liftIO $ withArray ps $ \ptr -> do
+        throwIfMinus1Retry_ "poll" $
+            c_zmq_poll ptr (fromIntegral len) (fromIntegral to)
+        peekArray len ptr
+    mapM fromZMQPoll (zip desc ps')
+  where
+    toZMQPoll :: MonadIO m => Poll m -> ZMQPoll
+    toZMQPoll (Sock (Socket (SocketRepr s _)) e _) =
+        ZMQPoll s 0 (combine (map fromEvent e)) 0
+
+    toZMQPoll (File (Fd s) e _) =
+        ZMQPoll nullPtr (fromIntegral s) (combine (map fromEvent e)) 0
+
+    fromZMQPoll :: MonadIO m => (Poll m, ZMQPoll) -> m [Event]
+    fromZMQPoll (p, zp) = do
+        let e = toEvents . fromIntegral . pRevents $ zp
+        let (e', f) = case p of
+                        (Sock _ x g) -> (x, g)
+                        (File _ x g) -> (x, g)
+        unless (null (e `intersect` e')) $
+            maybe (return ()) ($ e) f
+        return e
+
+    fromEvent :: Event -> CShort
+    fromEvent In   = fromIntegral . pollVal $ pollIn
+    fromEvent Out  = fromIntegral . pollVal $ pollOut
+    fromEvent Err  = fromIntegral . pollVal $ pollerr
+
+-- Convert bit-masked word into Event list.
+toEvents :: Word32 -> [Event]
+toEvents e = foldl' (\es f -> f e es) [] tests
+  where
+      tests =
+        [ \i xs -> if i .&. (fromIntegral . pollVal $ pollIn)  /= 0 then In:xs else xs
+        , \i xs -> if i .&. (fromIntegral . pollVal $ pollOut) /= 0 then Out:xs else xs
+        , \i xs -> if i .&. (fromIntegral . pollVal $ pollerr) /= 0 then Err:xs else xs
+        ]
 
 retry :: String -> IO () -> IO CInt -> IO ()
 retry msg wait act = throwIfMinus1RetryMayBlock_ msg act wait
@@ -836,4 +862,4 @@ proxy front back capture =
     onSocket "proxy-back" back $ \b ->
       void (c_zmq_proxy f b c)
   where
-    c = maybe nullPtr _socket capture
+    c = maybe nullPtr (_socket . _socketRepr) capture

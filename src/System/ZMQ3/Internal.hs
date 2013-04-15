@@ -1,6 +1,8 @@
 module System.ZMQ3.Internal
     ( Context(..)
     , Socket(..)
+    , SocketRepr(..)
+    , SocketType(..)
     , Message(..)
     , Flag(..)
     , Timeout
@@ -22,10 +24,14 @@ module System.ZMQ3.Internal
     , setInt32OptFromRestricted
     , ctxIntOption
     , setCtxIntOption
+    , getByteStringOpt
+    , setByteStringOpt
 
     , toZMQFlag
     , combine
-    , mkSocket
+    , combineFlags
+    , mkSocketRepr
+    , closeSock
     , onSocket
 
     , bool2cint
@@ -39,9 +45,9 @@ module System.ZMQ3.Internal
 import Control.Applicative
 import Control.Monad (foldM_, when)
 import Control.Exception
-import Data.IORef (IORef, mkWeakIORef, readIORef)
+import Data.IORef (IORef, mkWeakIORef, readIORef, atomicModifyIORef)
 
-import Foreign
+import Foreign hiding (throwIfNull)
 import Foreign.C.String
 import Foreign.C.Types (CInt, CSize)
 
@@ -104,10 +110,17 @@ data EventMsg =
 newtype Context = Context { _ctx :: ZMQCtx }
 
 -- | A 0MQ Socket.
-data Socket a = Socket {
-      _socket   :: ZMQSocket
-    , _sockLive :: IORef Bool
-    }
+newtype Socket a = Socket
+  { _socketRepr :: SocketRepr }
+
+data SocketRepr = SocketRepr
+  { _socket   :: ZMQSocket
+  , _sockLive :: IORef Bool
+  }
+
+-- | Socket types.
+class SocketType a where
+    zmqSocketType :: a -> ZMQSocketType
 
 -- A 0MQ Message representation.
 newtype Message = Message { msgPtr :: ZMQMsgPtr }
@@ -115,18 +128,25 @@ newtype Message = Message { msgPtr :: ZMQMsgPtr }
 -- internal helpers:
 
 onSocket :: String -> Socket a -> (ZMQSocket -> IO b) -> IO b
-onSocket _func (Socket sock _state) act = act sock
+onSocket _func (Socket (SocketRepr sock _state)) act = act sock
 {-# INLINE onSocket #-}
 
-mkSocket :: ZMQSocket -> IO (Socket a)
-mkSocket s = do
+mkSocketRepr :: SocketType t => t -> Context -> IO SocketRepr
+mkSocketRepr t c = do
+    let ty = typeVal (zmqSocketType t)
+    s   <- throwIfNull "mkSocketRepr" (c_zmq_socket (_ctx c) ty)
     ref <- newIORef True
     addFinalizer ref $ do
         alive <- readIORef ref
         when alive $ c_zmq_close s >> return ()
-    return (Socket s ref)
+    return (SocketRepr s ref)
   where
     addFinalizer r f = mkWeakIORef r f >> return ()
+
+closeSock :: SocketRepr -> IO ()
+closeSock (SocketRepr s status) = do
+  alive <- atomicModifyIORef status (\b -> (False, b))
+  when alive $ throwIfMinus1_ "close" . c_zmq_close $ s
 
 messageOf :: SB.ByteString -> IO Message
 messageOf b = UB.unsafeUseAsCStringLen b $ \(cstr, len) -> do
@@ -172,12 +192,17 @@ setIntOpt sock (ZMQOption o) i = onSocket "setIntOpt" sock $ \s ->
                            (castPtr ptr)
                            (fromIntegral . sizeOf $ i)
 
+setCStrOpt :: ZMQSocket -> ZMQOption -> CStringLen -> IO CInt
+setCStrOpt s (ZMQOption o) (cstr, len) =
+    c_zmq_setsockopt s (fromIntegral o) (castPtr cstr) (fromIntegral len)
+
+setByteStringOpt :: Socket a -> ZMQOption -> SB.ByteString -> IO ()
+setByteStringOpt sock opt str = onSocket "setByteStringOpt" sock $ \s ->
+    throwIfMinus1Retry_ "setByteStringOpt" . UB.unsafeUseAsCStringLen str $ setCStrOpt s opt
+
 setStrOpt :: Socket a -> ZMQOption -> String -> IO ()
-setStrOpt sock (ZMQOption o) str = onSocket "setStrOpt" sock $ \s ->
-  throwIfMinus1Retry_ "setStrOpt" $ withCStringLen str $ \(cstr, len) ->
-        c_zmq_setsockopt s (fromIntegral o)
-                           (castPtr cstr)
-                           (fromIntegral len)
+setStrOpt sock opt str = onSocket "setStrOpt" sock $ \s ->
+    throwIfMinus1Retry_ "setStrOpt" . withCStringLen str $ setCStrOpt s opt
 
 getIntOpt :: (Storable b, Integral b) => Socket a -> ZMQOption -> b -> IO b
 getIntOpt sock (ZMQOption o) i = onSocket "getIntOpt" sock $ \s -> do
@@ -187,13 +212,19 @@ getIntOpt sock (ZMQOption o) i = onSocket "getIntOpt" sock $ \s -> do
                 c_zmq_getsockopt s (fromIntegral o) (castPtr iptr) jptr
             peek iptr
 
-getStrOpt :: Socket a -> ZMQOption -> IO String
-getStrOpt sock (ZMQOption o) = onSocket "getStrOpt" sock $ \s ->
+getCStrOpt :: (CStringLen -> IO s) -> Socket a -> ZMQOption -> IO s
+getCStrOpt peekA sock (ZMQOption o) = onSocket "getCStrOpt" sock $ \s ->
     bracket (mallocBytes 255) free $ \bPtr ->
     bracket (new (255 :: CSize)) free $ \sPtr -> do
-        throwIfMinus1Retry_ "getStrOpt" $
+        throwIfMinus1Retry_ "getCStrOpt" $
             c_zmq_getsockopt s (fromIntegral o) (castPtr bPtr) sPtr
-        peek sPtr >>= \len -> peekCStringLen (bPtr, fromIntegral len)
+        peek sPtr >>= \len -> peekA (bPtr, fromIntegral len)
+
+getStrOpt :: Socket a -> ZMQOption -> IO String
+getStrOpt = getCStrOpt peekCStringLen
+
+getByteStringOpt :: Socket a -> ZMQOption -> IO SB.ByteString
+getByteStringOpt = getCStrOpt SB.packCStringLen
 
 getInt32Option :: ZMQOption -> Socket a -> IO Int
 getInt32Option o s = fromIntegral <$> getIntOpt s o (0 :: CInt)
@@ -213,8 +244,11 @@ toZMQFlag :: Flag -> ZMQFlag
 toZMQFlag DontWait = dontWait
 toZMQFlag SendMore = sndMore
 
-combine :: [Flag] -> CInt
-combine = fromIntegral . foldr ((.|.) . flagVal . toZMQFlag) 0
+combineFlags :: [Flag] -> CInt
+combineFlags = fromIntegral . combine . map (flagVal . toZMQFlag)
+
+combine :: (Integral i, Bits i) => [i] -> i
+combine = foldr (.|.) 0
 
 bool2cint :: Bool -> CInt
 bool2cint True  = 1
